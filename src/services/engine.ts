@@ -8,6 +8,7 @@ import wasmPath from '@/lib/bergamot/bergamot-translator.wasm' with { type: 'fil
 import * as logger from '@/logger/index.js';
 import * as models from '@/models/index.js';
 import { detectLanguage, detectMultipleLanguages } from './detector.js';
+import { readCache, writeCache } from '@/utils/cache.js';
 
 interface EngineInfo {
   engine: TranslationEngine;
@@ -128,26 +129,39 @@ async function translateSingleLanguageText(
   text: string,
   isHTML: boolean
 ): Promise<string> {
+  const cacheKey = [fromLang, toLang, text, isHTML];
+  const cached = readCache(cacheKey);
+  if (cached !== null) {
+    logger.debug(`Cache hit: ${fromLang} -> ${toLang}, text length: ${text.length}`);
+    return cached;
+  }
+
   const MAX_RETRIES = 3;
   let lastError: any;
 
   for (let i = 0; i < MAX_RETRIES; i++) {
     try {
       const engine = await getOrCreateSingleEngine(fromLang, toLang);
-      return await engine.translateAsync(text, { html: isHTML });
+      const result = await engine.translateAsync(text, { html: isHTML });
+      writeCache(result, cacheKey);
+      return result;
     } catch (error: any) {
       lastError = error;
+      const isSIMDError = error.message && (
+        error.message.includes('wasm-simd is not enabled') ||
+        error.message.includes('SIMD') ||
+        (error.message.includes('CompileError') && error.message.includes('WebAssembly'))
+      );
       const isMemoryError = error.message && (
         error.message.includes('Out of bounds memory access') ||
         error.message.includes('memory access out of bounds') ||
-        error.message.includes('unreachable') || 
+        error.message.includes('unreachable') ||
         error.message.includes('abort')
       );
 
       if (isMemoryError) {
         logger.warn(`WASM memory error during translation (${fromLang}->${toLang}), retrying (${i + 1}/${MAX_RETRIES})...`);
-        
-        // Remove the crashed engine so next retry gets a fresh one
+
         const key = `${fromLang}-${toLang}`;
         const info = engines.get(key);
         if (info) {
@@ -155,11 +169,19 @@ async function translateSingleLanguageText(
           info.engine.destroy();
           engines.delete(key);
         }
-        
+
         await new Promise(resolve => setTimeout(resolve, 100 * (i + 1)));
         continue;
       }
-      
+
+      if (isSIMDError) {
+        logger.fatal('WebAssembly SIMD is not supported on this CPU.');
+        logger.fatal('If you are using the standard build, please download and use the legacy build for non-AVX2 CPUs:');
+        logger.fatal('  - Binary: mtranserver-*-legacy');
+        logger.fatal('  - Docker: xxnuo/mtranserver:legacy');
+        logger.fatal('If you are already using the legacy build, sorry your CPU is too old to run MTranServer.');
+        process.exit(1);
+      }
       throw error;
     }
   }
@@ -270,7 +292,7 @@ async function translateLongText(
   logger.debug(`Splitting long text (${text.length} chars) into sentences`);
 
   const segmenterAny = new (Intl as any).Segmenter(undefined, { granularity: 'sentence' });
-  const sentences = Array.from(segmenterAny.segment(text)) as Array<{segment: string, index: number}>;
+  const sentences = Array.from(segmenterAny.segment(text)) as Array<{ segment: string, index: number }>;
 
   logger.debug(`Split into ${sentences.length} sentences`);
 
